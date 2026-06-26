@@ -932,3 +932,176 @@ CREATE INDEX idx_audit_status ON audit_log(status);
   "original_confidence": 0.42
 }
 ```
+
+
+---
+
+## 7. AI Tool Plan
+
+This section specifies what to hand the AI tool at each implementation milestone, what to ask it to generate, and how to verify the output before integrating it.
+
+The general workflow at each milestone: assemble the relevant spec sections from this document into a single prompt → ask the AI to generate specific files → review the output against the spec → test with concrete inputs → integrate into the project. The AI tool is a force-multiplier for translating spec into code, not a black box — every generated file is read, understood, and verified before it lands in the project.
+
+### M3 — Submission Endpoint + First Signal (Stylometric Analyser)
+
+**Goal:** A working Flask app that accepts POST /submit, rate-limits and normalises the input, runs the stylometric analyser against it, and returns a JSON response. No Groq dependency yet — pure Python end-to-end.
+
+**Spec sections to provide:**
+
+- **§2 Detection Signals: Deep Dive → Signal 2: Stylometric Analyser** (the full subsection including the four-metric table, normalisation strategy, and blind spots)
+- **§1 Architecture → Flow 1: Submission diagram** (the full ASCII diagram showing every component from Rate Limiter through Response Builder — the AI tool uses this to understand where the stylometric analyser sits in the pipeline and what its inputs/outputs are)
+- **§1 Architecture → Steps 1, 2, 4, 7, 8** (Rate Limiter, Input Normaliser, Stylometric Analyser, Audit Logger, Response Builder — the prose descriptions of the components it needs to implement now)
+- **§5 Rate Limiting Decisions** (the exact library, window, limit, and scope)
+- **§6 Audit Log Format → Schema SQL** (the CREATE TABLE statement so the audit log schema exists from day one)
+- **§4 API Surface → POST /submit** (the request/response contract — this is the acceptance test)
+
+**What to ask the AI to generate:**
+
+1. `app.py` — Flask app skeleton with:
+   - Flask-Limiter configured for IP-based rate limiting (10/min sliding window)
+   - `POST /submit` route with request parsing and JSON error responses (400, 429)
+   - Input normalisation: strip whitespace, collapse newlines, validate 50–10,000 chars
+   - Calls the stylometric analyser function and passes its output to the response builder
+   - Response assembly: the full JSON shape from the API spec, including signal sub-scores
+   - `GET /health` route
+
+2. `stylometric.py` — The Stylometric Analyser module with:
+   - `analyse_sentence_length_variance(text) → float` — stddev of sentence word-counts / mean, normalised to [0.0, 1.0] via fixed calibration thresholds
+   - `analyse_type_token_ratio(text) → float` — unique words / total words on first 500 words, normalised
+   - `analyse_punctuation_density(text) → float` — punctuation marks per sentence + diversity count, normalised
+   - `analyse_dependency_distance(text) → float` — approximated mean word-distance between adjacent nouns and verbs via POS adjacency, normalised
+   - `analyse(text) → dict` — runs all four, returns `{score, sub_scores: {...}}`
+
+3. `database.py` — SQLite setup with:
+   - `init_db()` — creates `audit_log` table from the schema in §6 if it doesn't exist
+   - `insert_entry(data: dict)` — inserts a classification row
+   - `lookup_by_content_id(content_id: str)` — retrieves a row by content ID
+
+4. `requirements.txt` — Flask, Flask-Limiter, and any other dependencies
+
+**Verification before wiring into the full pipeline:**
+
+1. **Unit test the four metrics:** Feed the stylometric analyser three hand-crafted strings — one clearly human (a paragraph with varied sentence lengths, diverse vocabulary, creative punctuation), one clearly AI (a paragraph of uniform-length sentences, repeated vocabulary, only commas and periods), and one edge case (exactly 50 words, minimal punctuation). Verify:
+   - The "human" string scores ≥ 0.65 average across the four metrics
+   - The "AI" string scores ≤ 0.35 average across the four metrics
+   - The edge-case string produces scores but with a flag/penalty noting the low word count
+
+2. **Integration test the endpoint:** Start the Flask dev server, POST three JSON payloads:
+   - Valid: `{"content": "A genuine paragraph with enough words to pass the minimum length check..."}` → expect 200 with full JSON response shape including `signals.stylometric.sub_scores`
+   - Too short: `{"content": "hi"}` → expect 400 with `error: "invalid_request"`
+   - Missing field: `{}` → expect 400
+   - Rate limit: Send 11 requests rapidly → the 11th should return 429
+
+3. **Smoke test the audit log:** After a successful submission, open the SQLite database and confirm one row exists with all classification fields populated (stylometric scores, content_id hash, timestamp, status = "classified").
+
+Once these pass, M3 is done — the stylometric signal is live, the endpoint works, and the audit log records everything. The LLM classifier slot in the pipeline is stubbed out (score = null or 0.50) until M4.
+
+---
+
+### M4 — Second Signal (LLM Classifier) + Confidence Scoring
+
+**Goal:** Add the Groq-backed LLM classifier as the second signal, wire both signals into the confidence scorer, and verify that the combined system produces meaningfully different scores for AI vs. human text.
+
+**Spec sections to provide:**
+
+- **§2 Detection Signals: Deep Dive → Signal 1: LLM Classifier (Groq)** (the full subsection including the structured prompt template, the verdict→score mapping table, and blind spots)
+- **§1 Architecture → Step 3: LLM Classifier** (the prose description of how it fits in the pipeline)
+- **§1 Architecture → Step 5: Confidence Scorer** (the full algorithm: weighted combination, distance-from-boundary formula, signal-disagreement cap)
+- **§1 Architecture → Uncertainty representation table** (what confidence values mean — the four bands)
+- **§1 Architecture → Label thresholds** (combined ≥ 0.70 → human, ≤ 0.30 → ai, else uncertain)
+- **§1 Architecture → Flow 1: Submission diagram** (the full diagram again — the AI tool needs the updated picture showing both signals converging into the confidence scorer)
+
+**What to ask the AI to generate:**
+
+1. `llm_classifier.py` — The LLM Classifier module with:
+   - The structured prompt (exact text from §2, with the `---` sandwich to isolate user content from instructions)
+   - `classify(text, api_key) → dict` — sends the text to Groq via the `llama-3.3-70b-versatile` model, parses the JSON response, maps verdict+confidence to a numeric score using the 7-point mapping table, and returns `{score, raw_verdict, raw_confidence, model, weight}`
+   - Error handling: if Groq returns non-JSON or the API is unreachable, return a safe fallback (`score: 0.50, raw_verdict: "error", raw_confidence: "low"`) rather than crashing the request
+   - Environment variable `GROQ_API_KEY` for the API key — never hardcoded
+
+2. `confidence_scorer.py` — The Confidence Scorer module with:
+   - `combine(llm_score, stylometric_score, llm_weight=0.55, stylometric_weight=0.45) → float` — weighted combination
+   - `confidence(combined_score) → float` — `2 * |combined - 0.5|`
+   - `check_disagreement(llm_score, stylometric_score, threshold=0.40) → bool` — returns True if signals disagree by more than the threshold
+   - `score(llm_result, stylometric_result) → dict` — runs all three above, applies the disagreement cap (caps confidence at 0.60 if signals disagree), determines label via the thresholds, and returns `{label, confidence, combined_score, signals: {...}}`
+
+3. Updates to `app.py`:
+   - Import and call `llm_classifier.classify()` in parallel with the stylometric analyser (using `concurrent.futures` or asyncio — since the Groq call has network latency, running them sequentially would double response time)
+   - Feed both scores into `confidence_scorer.score()`
+   - Include both signal details in the response
+
+**Verification — do scores vary meaningfully between clearly AI and clearly human text?**
+
+1. **AI-generated baseline:** Generate 3 texts with ChatGPT/Claude: a tech explainer (~300 words), a short story (~400 words), a product description (~150 words). Submit each to the endpoint. Record the combined score and confidence for each.
+
+2. **Human-written baseline:** Write 3 original texts matching the genres above. (Or use pre-AI-era public domain texts — e.g., a paragraph from a 1990s magazine article, a passage from a pre-2015 novel, a personal email.) Submit each. Record scores.
+
+3. **Separation check:** The AI texts should score ≤ 0.30 (label: "ai") and the human texts should score ≥ 0.70 (label: "human"). If the separation is weak — e.g., all six texts land in the 0.40–0.60 uncertain range — the calibration thresholds or the LLM prompt need tuning before proceeding to M5.
+
+4. **Disagreement check:** Submit a text deliberately designed to split the signals — e.g., AI-generated text that has been manually edited to add sentence-length variance and punctuation diversity. The stylometric score should be middling (0.40–0.60) while the LLM classifier may still lean AI. Verify that the signal-disagreement cap fires (confidence ≤ 0.60) and that the response correctly reflects both signals' raw values.
+
+5. **Edge case re-check:** Re-submit the edge cases from M3 verification. The combined system should produce **lower** or **more honest** confidence than either signal alone for cases where the signals legitimately struggle.
+
+---
+
+### M5 — Production Layer (Transparency Labels + Appeal Endpoint)
+
+**Goal:** Add the transparency label builder (three variants), the appeal endpoint, and the audit log query endpoint. The system is now feature-complete.
+
+**Spec sections to provide:**
+
+- **§1 Architecture → Step 6: Transparency Label Builder** (the three label variants with their exact text and the gating logic: confidence < 0.80 forces Label C)
+- **§1 Architecture → Flow 2: Appeal diagram** (the full ASCII diagram showing Appeal Handler → Status Updater → Audit Logger → Response Builder)
+- **§1 Architecture → Steps 7–8 and the full Appeal flow** (Audit Logger details, Appeal Handler, Status Updater)
+- **§4 API Surface → POST /appeal and GET /log** (the exact request/response contracts)
+- **§3 False Positive Scenario → System Response to Appeal** (the step-by-step walkthrough — this is the acceptance test for the appeal flow)
+- **§1 Architecture → Flow 1 and Flow 2 diagrams** (the AI tool needs both to understand how the label builder fits in the submission flow and how the appeal flow connects to the audit log)
+
+**What to ask the AI to generate:**
+
+1. `labels.py` — The Transparency Label Builder module with:
+   - Three label text constants (Label A, Label B, Label C) with the exact prose from §1 Step 6
+   - `build_label(label, confidence, combined_score) → dict` — applies the gating logic:
+     - If confidence < 0.80 → Label C regardless of label
+     - Else if label == "ai" → Label A
+     - Else if label == "human" → Label B
+     - Else → Label C (uncertain label)
+   - Returns `{variant: "A"|"B"|"C", text: "..."}`
+
+2. Updates to `app.py` (or a new `routes.py`):
+   - Integrate `labels.build_label()` into the `/submit` response — the `transparency_label` field in the JSON response now contains the full label text
+   - `POST /appeal` route:
+     - Parse `content_id` and `reason` from the request body
+     - Look up the content_id in SQLite → 404 if not found
+     - Check current status → 409 if already `"under_review"`
+     - Update status to `"under_review"` in the audit log
+     - Insert a new audit log row with `event_type: "appeal"`, linking to the original classification entry
+     - Return 200 with the appeal confirmation JSON shape from the API spec
+   - `GET /log` route with optional `?limit=N` and `?content_id=<hash>` query params
+
+3. Updates to `database.py`:
+   - `update_status(content_id, new_status)` — updates the status column
+   - `query_log(limit, content_id)` — returns entries with optional filtering
+
+**Verification — all three label variants reachable and appeal works correctly:**
+
+1. **Label variant reachability test:**
+   - Submit a clearly AI-generated text (both signals low) → expect Label A ("AI-Generated Content — High Confidence") with confidence ≥ 0.80
+   - Submit a clearly human-written text (both signals high) → expect Label B ("Likely Human-Authored — High Confidence") with confidence ≥ 0.80
+   - Submit a deliberately ambiguous text (e.g., the minimalist poem from Edge Case 1, or mix AI and human paragraphs) → expect Label C ("Attribution Uncertain") with confidence < 0.80
+   - **Critical gate check:** Submit a text that produces combined score ≤ 0.30 (label: "ai") but with confidence just barely over 0.50 (e.g., one signal strong, one signal middling). Verify the label variant is **C** (uncertain), not A — because confidence < 0.80 gates it, regardless of the binary label. The `transparency_label` text in the response should match Label C exactly.
+
+2. **Appeal flow test:**
+   - Pick a classified submission from the audit log (status: "classified")
+   - POST to `/appeal` with its `content_id` → expect 200, status: "under_review", a new `appeal_id`
+   - POST to `/appeal` again with the same `content_id` → expect 409 ("already_appealed")
+   - POST to `/appeal` with a nonexistent `content_id` → expect 404
+   - Query `GET /log?content_id=<hash>` → expect two entries: the original classification (status now "under_review") and the new appeal entry (linked via `linked_entry_id`)
+
+3. **Audit log query test:**
+   - `GET /log` → returns entries, default limit 20
+   - `GET /log?limit=5` → returns at most 5
+   - `GET /log?content_id=<hash>` → returns entries for that content only
+   - Verify each entry has the shape from the API spec (§4)
+
+4. **End-to-end false-positive walkthrough:** Replay the Jules scenario from §3 step by step through the live system. Submit the poem → verify scores land in the borderline range → verify Label C is displayed despite the binary label possibly being "ai" → submit an appeal → verify status transitions to "under_review" → query the log and verify both entries are present and linked. This is the project's defining scenario — it must work end-to-end.
