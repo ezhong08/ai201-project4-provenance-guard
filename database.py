@@ -138,20 +138,32 @@ def lookup_by_content_id(content_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def get_recent_entries(limit: int = 20, content_id: str | None = None) -> list[dict[str, Any]]:
-    """Return recent audit log entries, optionally filtered by content_id."""
+def get_recent_entries(
+    limit: int = 20,
+    content_id: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return recent audit log entries, optionally filtered by content_id and/or status."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+
+    where: list[str] = []
+    params: list[Any] = []
+
     if content_id:
-        rows = conn.execute(
-            "SELECT * FROM audit_log WHERE content_id = ? ORDER BY timestamp DESC LIMIT ?",
-            (content_id, limit),
-        ).fetchall()
+        where.append("content_id = ?")
+        params.append(content_id)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+
+    if where:
+        sql = f"SELECT * FROM audit_log WHERE {' AND '.join(where)} ORDER BY timestamp DESC LIMIT ?"
     else:
-        rows = conn.execute(
-            "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        sql = "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
 
     return [_row_to_dict(r) for r in rows]

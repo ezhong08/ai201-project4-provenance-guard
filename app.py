@@ -5,18 +5,19 @@ Multi-signal AI-content detection service.  Accepts text submissions,
 runs detection signals, and returns an attribution label with a
 confidence score and transparency label text.
 
-Current scope (M4):
-  - POST /submit  — both signals live, full confidence scoring
+Current scope (M5):
+  - POST /submit  — both signals live, full confidence scoring,
+                    transparency labels, structured audit log
+  - POST /appeal  — contest a classification, updates status
   - GET  /health  — liveness check
-  - GET  /log     — recent audit log entries
-
-M5 adds the transparency label builder and the appeal endpoint.
+  - GET  /log     — recent audit log entries with filtering
 """
 
 import concurrent.futures
 import hashlib
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
@@ -25,6 +26,7 @@ from flask_limiter.util import get_remote_address
 
 import confidence_scorer
 import database as db
+import labels
 import llm_classifier
 import stylometric
 
@@ -178,6 +180,9 @@ def submit():
     combined_score = scored["combined_score"]
     disagreement = scored["disagreement_detected"]
 
+    # --- Transparency label ---
+    label_result = labels.build_label(label, confidence)
+
     # --- Audit log ---
     elapsed_ms = round((time.perf_counter() - t_start) * 1000)
 
@@ -195,20 +200,13 @@ def submit():
         "signal_2_name": "stylometric",
         "signal_2_score": stylometric_result["score"],
         "signal_2_detail": stylometric_result,
-        "transparency_label_variant": None,  # M5
+        "transparency_label_variant": label_result["variant"],
         "submitter_ip_hash": _hash_ip(request.remote_addr or "unknown"),
         "processing_time_ms": elapsed_ms,
         "status": "classified",
     })
 
     # --- Response ---
-    #
-    # Four top-level fields (per instructions):
-    #   content_id   — SHA-256 of normalised text (used by /appeal)
-    #   attribution  — human-readable: "likely_human" | "likely_ai" | "uncertain"
-    #   confidence   — score in [0.0, 1.0]
-    #   label        — machine-readable: "human" | "ai" | "uncertain"
-
     _attribution_map = {
         "human": "likely_human",
         "ai": "likely_ai",
@@ -222,17 +220,72 @@ def submit():
         "label": label,
         "combined_score": combined_score,
         "disagreement_detected": disagreement,
-        "transparency_label": (
-            f"Attribution: {label.title()}\n"
-            f"Confidence: {confidence:.0%}\n\n"
-            "Note: Full transparency labels (variants A/B/C) will be "
-            "added in Milestone 5."
-        ),
+        "transparency_label": label_result["text"],
+        "transparency_label_variant": label_result["variant"],
         "signals": {
             "llm_classifier": llm_result,
             "stylometric": stylometric_result,
         },
         "status": "classified",
+    })
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    """
+    Contest a classification.
+
+    Request body (JSON):
+        {
+            "content_id": "sha256hexdigest",
+            "reason": "Explanation of why the classification may be wrong."
+        }
+
+    The field may also be named "creator_reasoning" (both are accepted).
+    """
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({"error": "invalid_request", "message": "Request body must be valid JSON."}), 400
+
+    content_id = data.get("content_id", "").strip()
+    if not content_id:
+        return jsonify({"error": "invalid_request", "message": "content_id is required."}), 400
+
+    reason = data.get("reason") or data.get("creator_reasoning") or ""
+    if not reason.strip():
+        return jsonify({"error": "invalid_request", "message": "reason is required."}), 400
+
+    # --- Look up original classification ---
+    original = db.lookup_by_content_id(content_id)
+    if original is None:
+        return jsonify({"error": "not_found", "message": "No classification found for the provided content_id."}), 404
+
+    if original.get("status") == "under_review":
+        return jsonify({"error": "already_appealed", "message": "This content is already under review."}), 409
+
+    # --- Update status ---
+    db.update_status(content_id, "under_review")
+
+    # --- Log the appeal ---
+    appeal_id = str(uuid.uuid4())
+    db.insert_entry({
+        "entry_id": appeal_id,
+        "event_type": "appeal",
+        "content_id": content_id,
+        "linked_entry_id": original.get("entry_id"),
+        "creator_reason": reason.strip(),
+        "original_label": original.get("label"),
+        "original_confidence": original.get("confidence"),
+        "status": "under_review",
+    })
+
+    return jsonify({
+        "content_id": content_id,
+        "status": "under_review",
+        "original_label": original.get("label"),
+        "original_confidence": original.get("confidence"),
+        "message": "Your appeal has been logged. A human reviewer will examine this classification.",
+        "appeal_id": appeal_id,
     })
 
 
@@ -243,7 +296,8 @@ def audit_log():
 
     Query params:
         limit      — max entries (default 20, max 100)
-        content_id — filter to a single content item (and any linked appeals)
+        content_id — filter to a single content item (and linked appeals)
+        status     — filter by status ("classified" | "under_review")
     """
     try:
         limit = int(request.args.get("limit", 20))
@@ -252,8 +306,9 @@ def audit_log():
     limit = max(1, min(limit, 100))
 
     content_id = request.args.get("content_id")
+    status_filter = request.args.get("status")
 
-    entries = db.get_recent_entries(limit=limit, content_id=content_id)
+    entries = db.get_recent_entries(limit=limit, content_id=content_id, status=status_filter)
 
     return jsonify({
         "entries": entries,
