@@ -26,6 +26,8 @@ import re
 
 from groq import Groq
 
+import content_types
+
 
 # ---------------------------------------------------------------------------
 # Score mapping
@@ -104,13 +106,15 @@ def _extract_json(raw: str) -> dict | None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def classify(text: str, api_key: str | None = None) -> dict:
+def classify(text: str, api_key: str | None = None, content_type: str = "text") -> dict:
     """
     Send *text* to Groq for AI-vs-human classification.
 
     Args:
         text: Normalised text to classify.
         api_key: Groq API key.  If None, reads GROQ_API_KEY from env.
+        content_type: "text" | "image_description" | "metadata" — determines
+                      the system prompt used.
 
     Returns:
         {
@@ -120,20 +124,22 @@ def classify(text: str, api_key: str | None = None) -> dict:
             "raw_confidence": str,    # "high" | "medium" | "low"
             "reasoning": str,         # model's one-sentence explanation
             "model": str,
+            "content_type": str,      # which content type was used
             "error": str | None,      # set only on fallback
         }
     """
     api_key = api_key or os.getenv("GROQ_API_KEY")
     if not api_key:
-        return _fallback("No GROQ_API_KEY set")
+        return _fallback("No GROQ_API_KEY set", content_type)
 
+    system_prompt = content_types.get_prompt(content_type)
     client = Groq(api_key=api_key)
 
     try:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": _build_user_prompt(text)},
             ],
             temperature=0.0,          # deterministic for classification
@@ -165,14 +171,15 @@ def classify(text: str, api_key: str | None = None) -> dict:
             "raw_confidence": raw_confidence,
             "reasoning": reasoning,
             "model": "llama-3.3-70b-versatile",
+            "content_type": content_type,
             "error": None,
         }
 
     except Exception as exc:
-        return _fallback(f"Groq API error: {exc}")
+        return _fallback(f"Groq API error: {exc}", content_type)
 
 
-def _fallback(reason: str) -> dict:
+def _fallback(reason: str, content_type: str = "text") -> dict:
     """Safe fallback when the LLM classifier cannot produce a result."""
     return {
         "score": 0.50,
@@ -181,5 +188,6 @@ def _fallback(reason: str) -> dict:
         "raw_confidence": "low",
         "reasoning": reason,
         "model": "llama-3.3-70b-versatile",
+        "content_type": content_type,
         "error": reason,
     }

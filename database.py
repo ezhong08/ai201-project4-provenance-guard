@@ -36,6 +36,7 @@ def init_db() -> None:
             event_type      TEXT NOT NULL,             -- 'classification' | 'appeal'
             content_id      TEXT NOT NULL,
             content_length  INTEGER,
+            content_type    TEXT DEFAULT 'text',       -- 'text' | 'image_description' | 'metadata'
             creator_id      TEXT,
 
             -- Classification fields (null for appeal entries)
@@ -88,19 +89,20 @@ def insert_entry(entry: dict[str, Any]) -> str:
     conn.execute("""
         INSERT INTO audit_log (
             entry_id, timestamp, event_type, content_id, content_length,
-            creator_id, label, confidence, combined_score,
+            content_type, creator_id, label, confidence, combined_score,
             signal_1_name, signal_1_score, signal_1_detail,
             signal_2_name, signal_2_score, signal_2_detail,
             transparency_label_variant, submitter_ip_hash, processing_time_ms,
             status, linked_entry_id, creator_reason,
             original_label, original_confidence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         entry_id,
         entry.get("timestamp", _utcnow()),
         entry.get("event_type", "classification"),
         entry.get("content_id", ""),
         entry.get("content_length"),
+        entry.get("content_type", "text"),
         entry.get("creator_id"),
         entry.get("label"),
         entry.get("confidence"),

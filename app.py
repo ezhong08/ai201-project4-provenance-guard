@@ -25,6 +25,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 import confidence_scorer
+import content_types
 import database as db
 import labels
 import llm_classifier
@@ -92,15 +93,21 @@ def _normalise(raw: str) -> str:
 
 
 def _validate(normalised: str) -> tuple[bool, str]:
-    """Return (valid, error_message)."""
+    """Return (valid, error_message) — used for backward compatibility."""
+    return _validate_for_type(normalised, "text")
+
+
+def _validate_for_type(normalised: str, content_type: str) -> tuple[bool, str]:
+    """Return (valid, error_message) using type-specific minimum length."""
     if not normalised:
         return False, "Content must be a non-empty string after normalisation."
 
+    min_len = content_types.get_min_length(content_type)
     length = len(normalised)
-    if length < 50:
+    if length < min_len:
         return False, (
             f"Content too short: {length} characters. "
-            "Minimum is 50 characters after normalisation."
+            f"Minimum is {min_len} characters for '{content_type}' after normalisation."
         )
     if length > 10_000:
         return False, (
@@ -127,13 +134,17 @@ def health():
 @limiter.limit("10 per minute")
 def submit():
     """
-    Submit text for attribution analysis.
+    Submit content for attribution analysis.
 
     Request body (JSON):
         {
             "text": "The text to analyse...",
-            "creator_id": "optional-user-identifier"
+            "creator_id": "optional-user-identifier",
+            "content_type": "text" | "image_description" | "metadata"  (default: "text")
         }
+
+    The content_type selects type-specific LLM prompts and stylometric
+    calibration.  See content_types.py for details.
 
     Returns a structured response with the detection result.
     """
@@ -146,6 +157,14 @@ def submit():
 
     raw_text = data.get("text", "")
     creator_id = data.get("creator_id")
+    content_type = data.get("content_type", "text")
+
+    if not content_types.is_valid_type(content_type):
+        return jsonify({
+            "error": "invalid_request",
+            "message": f"Unknown content_type: '{content_type}'. "
+                       f"Supported types: {', '.join(content_types.list_types())}.",
+        }), 400
 
     # --- Normalise ---
     try:
@@ -153,7 +172,7 @@ def submit():
     except ValueError:
         return jsonify({"error": "invalid_request", "message": "Content must be a string."}), 400
 
-    valid, msg = _validate(normalised)
+    valid, msg = _validate_for_type(normalised, content_type)
     if not valid:
         return jsonify({"error": "invalid_request", "message": msg}), 400
 
@@ -162,18 +181,28 @@ def submit():
     # --- Run detection signals in parallel ---
     #
     # Signal 1 (Groq LLM) and Signal 2 (Stylometric) are independent
-    # and run concurrently.  If the Groq call fails, the LLM result
-    # falls back to a neutral 0.50 and the error is logged.
+    # and run concurrently.  The content_type selects a type-specific
+    # LLM prompt and stylometric calibration.
+
+    type_config = content_types.get_config(content_type)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_llm = executor.submit(llm_classifier.classify, normalised)
+        future_llm = executor.submit(
+            llm_classifier.classify, normalised, None, content_type,
+        )
         future_stylometric = executor.submit(stylometric.analyse, normalised)
 
         llm_result = future_llm.result()
         stylometric_result = future_stylometric.result()
 
     # --- Full two-signal confidence scoring ---
-    scored = confidence_scorer.score(llm_result, stylometric_result)
+    #
+    # Pass type-specific LLM weight max so short-text weight shifts are
+    # calibrated per content type (metadata needs higher LLM weight than prose).
+    scored = confidence_scorer.score(
+        llm_result, stylometric_result,
+        llm_weight_max=type_config.get("llm_weight_max", 0.70),
+    )
 
     label = scored["label"]
     confidence = scored["confidence"]
@@ -190,6 +219,7 @@ def submit():
         "event_type": "classification",
         "content_id": content_id,
         "content_length": len(normalised),
+        "content_type": content_type,
         "creator_id": creator_id,
         "label": label,
         "confidence": confidence,
@@ -215,6 +245,7 @@ def submit():
 
     return jsonify({
         "content_id": content_id,
+        "content_type": content_type,
         "attribution": _attribution_map.get(label, "uncertain"),
         "confidence": confidence,
         "label": label,

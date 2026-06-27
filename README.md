@@ -63,6 +63,18 @@ Each metric is normalised to `[0.0, 1.0]` using fixed calibration thresholds, th
 
 **Why these two signals together:** One reads the text holistically for voice and authenticity; the other measures structural variance with a ruler. An adversary who defeats one signal has not automatically defeated the other. The stylometric signal costs nothing (no API call), runs in <1ms, and provides a cross-check against the LLM classifier's architectural blind spots.
 
+### Multi-modal content types
+
+The pipeline supports three content types, each with tailored LLM prompts and stylometric calibration:
+
+| Type | Typical use | LLM prompt focus | Stylometric adjustment |
+|---|---|---|---|
+| `text` (default) | Prose, poems, blog posts | Voice, emotional texture, lived experience | Standard calibration |
+| `image_description` | Alt text, captions, visual descriptions | Subjective observation vs clinical accuracy | Higher LLM weight for short texts (0.75 max); relaxed minimum length (20 chars) |
+| `metadata` | Author bios, tags, structured metadata | Personal quirks, genre jargon vs keyword-stuffed output | LLM carries nearly all weight (0.80 max); minimum length 10 chars |
+
+The `content_type` is passed through the entire pipeline — the LLM receives a type-specific system prompt, the confidence scorer uses type-specific weight caps, and the audit log records which type was analysed. See [content_types.py](content_types.py) for the full configurations.
+
 ---
 
 ## Confidence Scoring
@@ -290,15 +302,18 @@ Submit text for attribution analysis. Rate limited: 10 requests/minute/IP.
 **Request:**
 ```json
 {
-  "text": "The text to analyse (50–10,000 characters after normalisation).",
-  "creator_id": "optional-user-identifier"
+  "text": "The text to analyse (10–10,000 characters after normalisation).",
+  "creator_id": "optional-user-identifier",
+  "content_type": "text | image_description | metadata  (default: text)"
 }
 ```
+Minimum length varies by content type: 50 chars for `text`, 20 for `image_description`, 10 for `metadata`.
 
 **Response `200 OK`:**
 ```json
 {
   "content_id": "sha256hexdigest",
+  "content_type": "text",
   "attribution": "likely_ai",
   "label": "ai",
   "confidence": 0.72,

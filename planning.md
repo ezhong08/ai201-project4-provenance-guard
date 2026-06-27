@@ -1105,3 +1105,43 @@ Once these pass, M3 is done — the stylometric signal is live, the endpoint wor
    - Verify each entry has the shape from the API spec (§4)
 
 4. **End-to-end false-positive walkthrough:** Replay the Jules scenario from §3 step by step through the live system. Submit the poem → verify scores land in the borderline range → verify Label C is displayed despite the binary label possibly being "ai" → submit an appeal → verify status transitions to "under_review" → query the log and verify both entries are present and linked. This is the project's defining scenario — it must work end-to-end.
+
+---
+
+## 8. Multi-Modal Support
+
+The pipeline supports three content types beyond plain prose. Each type uses a tailored LLM classifier prompt and stylometric calibration, acknowledging that different content types have different structural norms.
+
+### Supported content types
+
+| Type | Typical content | Min length | Short-text LLM weight max | Detection approach |
+|---|---|---|---|---|
+| `text` | Prose, poems, blog posts, stories | 50 chars | 0.70 | Default — both signals at standard calibration |
+| `image_description` | Alt text, image captions, visual descriptions | 20 chars | 0.75 | LLM prompt tuned for visual-description patterns (subjective observation vs clinical accuracy); stylometric thresholds relaxed for short descriptive text |
+| `metadata` | Author bios, content tags, structured metadata | 10 chars | 0.80 | LLM prompt looks for personal quirks and genre-specific jargon vs generic keyword-stuffed output; stylometric near-ignored at typical metadata lengths |
+
+### Architecture
+
+The `content_type` parameter flows from the request through every component:
+
+```
+POST /submit {content_type: "image_description", ...}
+  → Input Normaliser       → [normalised text]
+  → LLM Classifier         → uses type-specific system prompt
+  → Stylometric Analyser   → type-specific short-text thresholds
+  → Confidence Scorer      → type-specific llm_weight_max
+  → Audit Logger           → logs content_type column
+  → Response               → includes content_type field
+```
+
+### Type-specific LLM prompts
+
+Each content type has a distinct system prompt in [content_types.py](content_types.py):
+
+- **text**: Assesses naturalness of voice, personal perspective, lived experience, emotional texture
+- **image_description**: Assesses subjective observation vs clinical accuracy, sensory language, imperfect phrasing vs systematic exhaustiveness
+- **metadata**: Assesses personal quirks, genre-specific jargon, inconsistent formatting vs formal consistency and keyword stuffing
+
+### Design rationale
+
+A single detection pipeline calibrated only for prose would misclassify image descriptions and metadata because they're structurally different: shorter, more formulaic, and judged by different human/AI criteria. Rather than building entirely separate pipelines, the multi-modal approach reuses the same two-signal architecture with type-specific calibration. The LLM prompt is the most impactful adjustment — it tells the classifier *what patterns to look for* in each content type, which is more flexible than hard-coded threshold changes alone.

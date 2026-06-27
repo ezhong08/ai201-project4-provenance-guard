@@ -34,29 +34,29 @@ DISAGREEMENT_CAP = 0.60
 # Public API
 # ---------------------------------------------------------------------------
 
-def _effective_weights(text_length: int | None) -> tuple[float, float]:
+def _effective_weights(
+    text_length: int | None,
+    max_llm_weight: float = 0.70,
+) -> tuple[float, float]:
     """
     Return (llm_weight, stylometric_weight) adjusted for text length.
 
     When text is under 100 words the stylometric metrics are unreliable
     (planning.md §3b Edge Case 4).  The LLM weight increases linearly
-    from its default 0.55 to 0.70 at 50 words — a meaningful shift
-    that still keeps the stylometric in play so a single fooled LLM
-    call can't completely dominate.
+    from its default 0.55 to *max_llm_weight* at 50 words.
+
+    Different content types can set different max weights via
+    content_types.py (e.g., metadata gets 0.80 since it's always short).
     """
     if text_length is None or text_length >= 100:
         return LLM_WEIGHT, STYLOMETRIC_WEIGHT
 
-    # Cap at 0.70 for very short texts (was 0.80 — too aggressive;
-    # gave full control to the LLM and let adversarial edits through)
-    MAX_LLM_WEIGHT = 0.70
-
     if text_length <= 50:
-        return MAX_LLM_WEIGHT, round(1.0 - MAX_LLM_WEIGHT, 4)
+        return max_llm_weight, round(1.0 - max_llm_weight, 4)
 
-    # Linear ramp from 0.55 at 100 words to MAX_LLM_WEIGHT at 50 words
+    # Linear ramp from 0.55 at 100 words to max_llm_weight at 50 words
     frac = (100 - text_length) / 50.0        # 0.0 at 100w, 1.0 at 50w
-    llm_w = LLM_WEIGHT + frac * (MAX_LLM_WEIGHT - LLM_WEIGHT)
+    llm_w = LLM_WEIGHT + frac * (max_llm_weight - LLM_WEIGHT)
     return round(llm_w, 4), round(1.0 - llm_w, 4)
 
 
@@ -111,18 +111,21 @@ def determine_label(combined: float) -> str:
 def score(
     llm_result: dict[str, Any] | None,
     stylometric_result: dict[str, Any],
+    llm_weight_max: float = 0.70,
 ) -> dict:
     """
     Full confidence scoring: combine signals, compute confidence,
     apply disagreement cap, and determine the label.
 
     Weights are adjusted dynamically based on text length:
-    under 100 words the LLM weight increases (up to 0.80 at ≤50 words)
-    because stylometric metrics are unreliable on short texts.
+    under 100 words the LLM weight increases (up to *llm_weight_max*
+    at ≤50 words) because stylometric metrics are unreliable on
+    short texts.  The max can be overridden per content type.
 
     Args:
         llm_result:  Output of llm_classifier.classify() (or None if stubbed).
         stylometric_result: Output of stylometric.analyse().
+        llm_weight_max: Max LLM weight for very short texts (default 0.70).
 
     Returns:
         {
@@ -137,7 +140,7 @@ def score(
     stylometric_score = stylometric_result["score"]
     text_length = stylometric_result.get("text_length")
 
-    llm_w, sty_w = _effective_weights(text_length)
+    llm_w, sty_w = _effective_weights(text_length, llm_weight_max)
     combined = combine(llm_score, stylometric_score, llm_w, sty_w)
 
     raw_confidence = distance_confidence(combined)
