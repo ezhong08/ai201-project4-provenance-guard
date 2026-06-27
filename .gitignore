@@ -1,2 +1,4 @@
 .env
 Project.txt
+*.db
+__pycache__
